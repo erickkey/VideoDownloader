@@ -431,7 +431,10 @@ struct ContentView: View {
             }
             .padding(.top, 8)
         } label: {
-            Text("Дополнительно").font(.callout)
+            Text("Дополнительно")
+                .font(.callout)
+                .contentShape(Rectangle())
+                .onTapGesture { showAdvanced.toggle() }
         }
     }
 
