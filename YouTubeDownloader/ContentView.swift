@@ -149,7 +149,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("VideoDownloader")
                     .font(.title2.bold())
-                Text("YouTube, VK и сотни других сайтов → MP4 / H.264. Вставьте ссылку и нажмите «Скачать».")
+                Text("YouTube, VK, Instagram, TikTok и сотни других сайтов → MP4 / H.264. Скопируй ссылку и нажми «Скачать». Ещё можно проверить доступные варианты качества для скачивания.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -611,7 +611,7 @@ struct AboutView: View {
                     .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.accentColor.opacity(0.35)))
 
                 Text("VideoDownloader").font(.title2.bold())
-                Text("Качает видео с YouTube, VK, Vimeo, Одноклассников, Дзена и ещё ~1750 сайтов. Сохраняет в .mp4 с кодеком H.264 — такой файл открывается где угодно.")
+                Text("Качает видео с YouTube, VK, Instagram, TikTok, Vimeo, Одноклассников, Дзена и ещё ~1750 сайтов. Сохраняет в .mp4 с кодеком H.264 — такой файл открывается где угодно.")
                     .foregroundStyle(.secondary)
 
                 infoSection("Что умеет", [
