@@ -87,6 +87,7 @@ struct ContentView: View {
         .onChange(of: appearance) { _ in applyAppearance() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             fillURLFromClipboardIfEmpty()
+            updateChecker.check()
         }
         .onChange(of: manager.progress) { _ in updateDockProgress() }
         .onChange(of: manager.isRunning) { _ in updateDockProgress() }
