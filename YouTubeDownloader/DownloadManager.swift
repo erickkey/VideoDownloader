@@ -1,0 +1,980 @@
+import Foundation
+import Combine
+import AVFoundation
+
+/// Runs the external command-line jobs the app needs: a `yt-dlp` download, or a
+/// Homebrew install / upgrade of `yt-dlp` + `ffmpeg`. Only one job runs at a time.
+final class DownloadManager: ObservableObject {
+
+    enum Phase: Equatable {
+        case idle
+        case running
+        case finished
+        case cancelled
+        case failed(String)
+    }
+
+    private enum Job {
+        case download
+        case transcode                                   // ffmpeg → H.264
+        case tooling(label: String, successStatus: String)
+
+        var label: String {
+            switch self {
+            case .download: return "yt-dlp"
+            case .transcode: return "ffmpeg"
+            case .tooling(let label, _): return label
+            }
+        }
+
+        var isTooling: Bool {
+            if case .tooling = self { return true }
+            return false
+        }
+    }
+
+    // MARK: Published state (mutated on the main queue only)
+
+    @Published private(set) var phase: Phase = .idle
+    @Published private(set) var progress: Double = 0          // 0.0 ... 1.0
+    @Published private(set) var indeterminate = false         // brew jobs have no %
+    @Published private(set) var statusLine: String = ""
+    @Published private(set) var log: String = ""
+
+    @Published private(set) var ytDlpPath: String?
+    @Published private(set) var ffmpegPath: String?
+    @Published private(set) var brewPath: String?
+
+    /// Set when a download needs Safari cookies but the app lacks Full Disk Access.
+    @Published private(set) var needsFullDiskAccess = false
+
+    /// The finished video file (for "Показать файл"). Nil until a download completes.
+    @Published private(set) var lastDownloadedFile: URL?
+
+    // Quality probe.
+    @Published private(set) var isProbing = false
+    @Published private(set) var probedTitle: String?
+    @Published private(set) var availableHeights: [Int] = []      // sorted high → low
+
+    /// True while downloading a fragmented (DASH/HLS) stream.
+    @Published private(set) var fragmentedDownload = false
+    /// True when the current download is from a site that serves video in many
+    /// tiny slow fragments (Vimeo). Used only to show an explanatory note.
+    @Published private(set) var slowFragmentedSite = false
+
+    private enum CookieSource: Equatable {
+        case none
+        case browser(String)
+
+        var ytDlpArgs: [String] {
+            switch self {
+            case .none: return []
+            case .browser(let b): return ["--cookies-from-browser", DownloadManager.cookiesBrowserArg(for: b)]
+            }
+        }
+        var describe: String {
+            switch self {
+            case .none: return "без входа"
+            case .browser(let b): return "cookies из \(b.capitalized)"
+            }
+        }
+        var storageKey: String {
+            switch self {
+            case .none: return ""
+            case .browser(let b): return "browser:\(b)"
+            }
+        }
+        static func fromStorage(_ s: String) -> CookieSource? {
+            if s.hasPrefix("browser:") { return .browser(String(s.dropFirst(8))) }
+            return nil
+        }
+    }
+
+    private var process: Process?
+    private var currentJob: Job = .download
+    private var lineBuffer = Data()
+
+    private var lastDestination: URL?          // folder of the current/last download
+    private var transcodeInput: URL?           // original file being replaced
+    private var transcodeOutput: URL?          // ffmpeg's temp output
+    private var transcodeDuration: Double?     // seconds, for progress
+
+    // Auto cookie-fallback state for the current download request.
+    private var pendingURL = ""
+    private var pendingMaxHeight: Int?
+    private var pendingAudioOnly = false
+    private var cookieQueue: [CookieSource] = []
+    private var currentCookieSource: CookieSource = .none
+    private var downloadAttempt = 0
+    private var sawSafariPermissionBlock = false
+
+    private let lastCookieKey = "lastCookieSource"
+
+    private var chimePlayer: AVAudioPlayer?
+    private var probeTimer: Timer?
+
+    private let ytDlpKey = "ytDlpPath"
+    private let ffmpegKey = "ffmpegPath"
+
+    init() {
+        refreshTools()
+    }
+
+    var isRunning: Bool { phase == .running }
+    var toolsReady: Bool { ytDlpPath != nil && ffmpegPath != nil }
+    var hasHomebrew: Bool { brewPath != nil }
+
+    /// Are both tools the copies shipped inside the .app?
+    var usingBundledTools: Bool {
+        guard let y = ytDlpPath, let f = ffmpegPath else { return false }
+        return ToolLocator.isBundled(y) && ToolLocator.isBundled(f)
+    }
+
+    // MARK: Tool discovery
+
+    func refreshTools() {
+        let defaults = UserDefaults.standard
+        ytDlpPath = ToolLocator.find("yt-dlp", userOverride: defaults.string(forKey: ytDlpKey))
+        ffmpegPath = ToolLocator.find("ffmpeg", userOverride: defaults.string(forKey: ffmpegKey))
+        brewPath = ToolLocator.find("brew", userOverride: nil)
+    }
+
+    func setYtDlpPath(_ path: String) {
+        UserDefaults.standard.set(path, forKey: ytDlpKey)
+        refreshTools()
+    }
+
+    func setFfmpegPath(_ path: String) {
+        UserDefaults.standard.set(path, forKey: ffmpegKey)
+        refreshTools()
+    }
+
+    func cancel() {
+        process?.terminate()
+    }
+
+    // MARK: Quality probe
+
+    /// Clears a previous probe result (call when the URL changes).
+    func resetProbe() {
+        guard !isProbing else { return }
+        if probedTitle != nil || !availableHeights.isEmpty {
+            probedTitle = nil
+            availableHeights = []
+        }
+    }
+
+    /// Asks yt-dlp which resolutions this URL actually has, and publishes them.
+    func probeQuality(urlString: String) {
+        guard !isRunning, !isProbing else { return }
+        let url = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !url.isEmpty, let ytDlp = ytDlpPath else { return }
+
+        if ToolLocator.isBundled(ytDlp), let dir = ToolLocator.bundledBinDirectory {
+            Self.clearQuarantine(dir)
+        }
+
+        isProbing = true
+        probedTitle = nil
+        availableHeights = []
+
+        let start = Date()
+        statusLine = "Проверяю доступные качества… 0 с"
+        probeTimer?.invalidate()
+        probeTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            let elapsed = Int(Date().timeIntervalSince(start))
+            self?.statusLine = "Проверяю доступные качества… \(elapsed) с"
+        }
+
+        let lastGood = CookieSource.fromStorage(
+            UserDefaults.standard.string(forKey: lastCookieKey) ?? "")
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var result = Self.runProbe(ytDlp: ytDlp, url: url, cookieArgs: [])
+            if result == nil, let lastGood, case .browser = lastGood {
+                result = Self.runProbe(ytDlp: ytDlp, url: url, cookieArgs: lastGood.ytDlpArgs)
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.probeTimer?.invalidate()
+                self.probeTimer = nil
+                self.isProbing = false
+                let elapsed = String(format: "%.1f", Date().timeIntervalSince(start))
+                if let (title, heights) = result, !heights.isEmpty {
+                    self.probedTitle = title
+                    self.availableHeights = heights
+                    self.statusLine = "Доступно (\(elapsed) с): " + heights.map { "\($0)p" }.joined(separator: ", ")
+                } else {
+                    self.statusLine = "Не удалось определить качества за \(elapsed) с — при скачивании возьмётся максимум доступное."
+                }
+            }
+        }
+    }
+
+    private static func runProbe(ytDlp: String, url: String, cookieArgs: [String]) -> (title: String, heights: [Int])? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: ytDlp)
+        p.arguments = ["-J", "--no-warnings", "--no-playlist", "--no-progress"] + cookieArgs + [url]
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+        p.environment = env
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = Pipe()
+
+        guard (try? p.run()) != nil else { return nil }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+
+        guard p.terminationStatus == 0,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+
+        let title = (json["title"] as? String) ?? "видео"
+        var heights = Set<Int>()
+        for f in (json["formats"] as? [[String: Any]]) ?? [] {
+            guard (f["vcodec"] as? String).map({ $0 != "none" }) ?? false else { continue }
+            if let h = f["height"] as? Int, h > 0 { heights.insert(roundedHeight(h)) }
+        }
+        if let h = json["height"] as? Int, h > 0 { heights.insert(roundedHeight(h)) }
+        return (title, heights.sorted(by: >))
+    }
+
+    /// Snap odd heights (e.g. 1088, 362) to the familiar rung.
+    private static func roundedHeight(_ h: Int) -> Int {
+        let rungs = [4320, 2160, 1440, 1080, 720, 480, 360, 240, 144]
+        return rungs.min(by: { abs($0 - h) < abs($1 - h) }) ?? h
+    }
+
+    // MARK: Tooling jobs (install / update yt-dlp + ffmpeg)
+
+    func installTools() {
+        runBrew(["install", "yt-dlp", "ffmpeg"],
+                successStatus: "yt-dlp и ffmpeg установлены ✅",
+                startStatus: "Установка yt-dlp и ffmpeg через Homebrew…")
+    }
+
+    func updateTools() {
+        // The bundled yt-dlp is a standalone binary that self-updates.
+        if let ytDlp = ytDlpPath, ToolLocator.isBundled(ytDlp), !isRunning {
+            var env = ProcessInfo.processInfo.environment
+            env["PATH"] = "/usr/bin:/bin"
+            run(executableURL: URL(fileURLWithPath: ytDlp),
+                arguments: ["-U"],
+                environment: env,
+                job: .tooling(label: "yt-dlp", successStatus: "yt-dlp обновлён ✅"),
+                startStatus: "Обновление встроенного yt-dlp…")
+            return
+        }
+
+        runBrew(["upgrade", "--formula", "yt-dlp", "ffmpeg"],
+                successStatus: "yt-dlp и ffmpeg обновлены ✅",
+                startStatus: "Обновление yt-dlp и ffmpeg…")
+    }
+
+    private func runBrew(_ brewArgs: [String], successStatus: String, startStatus: String) {
+        guard !isRunning else { return }
+        guard let brew = brewPath else {
+            phase = .failed("""
+            Homebrew не найден. Установите его одной командой в Терминале:
+
+            /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+            затем нажмите «Проверить снова».
+            """)
+            return
+        }
+
+        let brewDir = (brew as NSString).deletingLastPathComponent
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = "\(brewDir):/usr/bin:/bin:/usr/sbin:/sbin"
+        env["HOMEBREW_NO_ENV_HINTS"] = "1"
+        env["HOMEBREW_NO_INSTALL_CLEANUP"] = "1"
+
+        run(executableURL: URL(fileURLWithPath: brew),
+            arguments: brewArgs,
+            environment: env,
+            job: .tooling(label: "Homebrew", successStatus: successStatus),
+            startStatus: startStatus)
+    }
+
+    // MARK: Download job
+
+    /// Downloads `urlString` into `destination` as an H.264 `.mp4`, doing
+    /// everything automatically:
+    ///  - tries without cookies first (fast path for public videos);
+    ///  - if the video needs a login, retries with cookies from each installed
+    ///    browser (Safari, Chrome, …);
+    ///  - remembers the source that worked and tries it first next time;
+    ///  - transcodes VP9/AV1 to H.264 after the download if needed.
+    ///
+    /// With `audioOnly`, downloads the audio track only and converts it to a
+    /// 320 kbps MP3 instead (quality is ignored).
+    func start(urlString: String,
+               destination: URL,
+               maxHeight: Int?,
+               audioOnly: Bool = false) {
+
+        guard !isRunning else { return }
+
+        let url = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !url.isEmpty else {
+            phase = .failed("Вставьте ссылку на видео.")
+            return
+        }
+        guard ytDlpPath != nil else {
+            phase = .failed("yt-dlp не найден. Откройте «Дополнительно» → «Установить».")
+            return
+        }
+        guard ffmpegPath != nil else {
+            phase = .failed("ffmpeg не найден. Откройте «Дополнительно» → «Установить».")
+            return
+        }
+
+        pendingURL = url
+        pendingMaxHeight = maxHeight
+        pendingAudioOnly = audioOnly
+        lastDestination = destination
+        lastDownloadedFile = nil
+        fragmentedDownload = false
+        slowFragmentedSite = url.lowercased().contains("vimeo.")
+        needsFullDiskAccess = false
+        sawSafariPermissionBlock = false
+        downloadAttempt = 0
+        transcodeInput = nil
+        transcodeOutput = nil
+        transcodeDuration = nil
+
+        // Ordered list of things to try. Always start with no cookies — fast and
+        // transparent for the vast majority of (public) videos. Only if that
+        // fails do we reach for cookies, trying the browser that worked last
+        // time first (skips retrying browsers that are known not to be logged in).
+        var browsers: [CookieSource] = Self.installedCookieBrowsers().map { .browser($0) }
+        if let good = CookieSource.fromStorage(UserDefaults.standard.string(forKey: lastCookieKey) ?? ""),
+           browsers.contains(good) {
+            browsers.removeAll { $0 == good }
+            browsers.insert(good, at: 0)
+        }
+        cookieQueue = [.none] + browsers
+
+        runNextDownloadAttempt()
+    }
+
+    private func runNextDownloadAttempt() {
+        guard !cookieQueue.isEmpty,
+              let ytDlp = ytDlpPath,
+              let ffmpeg = ffmpegPath,
+              let destination = lastDestination else { return }
+
+        let source = cookieQueue.removeFirst()
+        currentCookieSource = source
+
+        let ffmpegDir = (ffmpeg as NSString).deletingLastPathComponent
+        let heightFilter = pendingMaxHeight.map { "[height<=\($0)]" } ?? ""
+
+        func outTemplate(_ name: String) -> String {
+            destination.appendingPathComponent(name).path
+        }
+
+        var arguments: [String] = [
+            "--newline",
+            "--no-color",
+            "--no-playlist",
+            "--ffmpeg-location", ffmpegDir,
+            // Pull DASH/HLS fragments in parallel — big speed-up for Vimeo etc.
+            "--concurrent-fragments", "5",
+        ]
+        if pendingAudioOnly {
+            arguments += [
+                "-f", "ba/b",
+                "-x", "--audio-format", "mp3", "--audio-quality", "320K",
+                // «Название (VideoDownloader).mp3»
+                "-o", outTemplate("%(title)s (VideoDownloader).%(ext)s"),
+            ]
+        } else {
+            let formatSpec: String
+            let sortSpec: String
+            if pendingMaxHeight != nil {
+                // Explicit height chosen → take the highest available at/below it,
+                // even if that means a VP9/AV1 pick that gets transcoded afterwards.
+                formatSpec = "bv*\(heightFilter)+ba/b\(heightFilter)/bv*+ba/b"
+                sortSpec = "res,vcodec:h264,ext:mp4,br"
+            } else {
+                // "Максимальное" → best ready-made H.264 (fast, no re-encode);
+                // only fall back to VP9/AV1 if the site has no H.264 at all.
+                formatSpec = "bv*[vcodec^=avc1]+ba/b[vcodec^=avc1]/bv*+ba/b"
+                sortSpec = "vcodec:h264,res,ext:mp4,br"
+            }
+            arguments += [
+                "-f", formatSpec,
+                "-S", sortSpec,
+                "--merge-output-format", "mp4",
+                "--remux-video", "mp4",
+                // «Название (VideoDownloader) 1920x1080.mp4»
+                "-o", outTemplate("%(title)s (VideoDownloader) %(width)sx%(height)s.%(ext)s"),
+            ]
+        }
+        arguments += source.ytDlpArgs
+        arguments.append(pendingURL)
+
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = "\(ffmpegDir):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+
+        // Only call it "нужен вход" on an actual retry (attempt > 0) — the very
+        // first attempt is never announced as a login requirement, even if it
+        // happens to use remembered cookies straight away.
+        let startStatus = (downloadAttempt == 0)
+            ? "Скачивание сейчас начнётся…"
+            : "Нужен вход — пробую \(source.describe)…"
+
+        run(executableURL: URL(fileURLWithPath: ytDlp),
+            arguments: arguments,
+            environment: env,
+            job: .download,
+            startStatus: startStatus,
+            resetLog: downloadAttempt == 0)
+
+        downloadAttempt += 1
+    }
+
+    /// Browsers whose cookies we can try. Safari is always present on macOS;
+    /// the others only if their data folder exists.
+    static func installedCookieBrowsers() -> [String] {
+        let home = NSHomeDirectory()
+        let fm = FileManager.default
+        var out: [String] = ["safari"]
+        if fm.fileExists(atPath: "\(home)/Library/Application Support/Google/Chrome") { out.append("chrome") }
+        if fm.fileExists(atPath: "\(home)/Library/Application Support/Firefox/Profiles") { out.append("firefox") }
+        if fm.fileExists(atPath: "\(home)/Library/Application Support/Yandex/YandexBrowser") { out.append("yandex") }
+        return out
+    }
+
+    // MARK: Shared process runner
+
+    private func run(executableURL: URL,
+                     arguments: [String],
+                     environment: [String: String],
+                     job: Job,
+                     startStatus: String,
+                     resetLog: Bool = true) {
+
+        currentJob = job
+        progress = 0
+        indeterminate = job.isTooling
+        statusLine = startStatus
+        if resetLog { log = "" } else { log += "\n— \(startStatus) —\n" }
+        lineBuffer.removeAll(keepingCapacity: true)
+        phase = .running
+
+        let process = Process()
+        process.executableURL = executableURL
+        process.arguments = arguments
+        process.environment = environment
+
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+
+        let onData: (FileHandle) -> Void = { [weak self] handle in
+            let chunk = handle.availableData
+            guard !chunk.isEmpty else { return }
+            DispatchQueue.main.async { self?.consume(chunk) }
+        }
+        outPipe.fileHandleForReading.readabilityHandler = onData
+        errPipe.fileHandleForReading.readabilityHandler = onData
+
+        process.terminationHandler = { [weak self] proc in
+            let status = proc.terminationStatus
+            let reason = proc.terminationReason
+            DispatchQueue.main.async {
+                outPipe.fileHandleForReading.readabilityHandler = nil
+                errPipe.fileHandleForReading.readabilityHandler = nil
+                self?.finish(status: status, reason: reason)
+            }
+        }
+
+        self.process = process
+
+        // Binaries shipped inside the .app inherit the download quarantine flag on
+        // the recipient's machine; clear it so Gatekeeper lets them execute.
+        if ToolLocator.isBundled(executableURL.path),
+           let binDir = ToolLocator.bundledBinDirectory {
+            Self.clearQuarantine(binDir)
+        }
+
+        do {
+            try process.run()
+        } catch {
+            phase = .failed("Не удалось запустить \(executableURL.lastPathComponent): \(error.localizedDescription)")
+            self.process = nil
+        }
+    }
+
+    /// yt-dlp knows safari/chrome/firefox natively. Yandex Browser is a Chromium
+    /// fork it doesn't list, so point the `chrome` reader at its profile directory.
+    private static func cookiesBrowserArg(for browser: String) -> String {
+        guard browser == "yandex" else { return browser }
+        let profile = "\(NSHomeDirectory())/Library/Application Support/Yandex/YandexBrowser"
+        return "chrome:\(profile)"
+    }
+
+    private static func clearQuarantine(_ path: String) {
+        let xattr = Process()
+        xattr.executableURL = URL(fileURLWithPath: "/usr/bin/xattr")
+        xattr.arguments = ["-dr", "com.apple.quarantine", path]
+        xattr.standardOutput = Pipe()
+        xattr.standardError = Pipe()
+        try? xattr.run()
+        xattr.waitUntilExit()
+    }
+
+    // MARK: Output parsing (main queue)
+
+    private func consume(_ chunk: Data) {
+        lineBuffer.append(chunk)
+
+        while let newline = lineBuffer.firstIndex(where: { $0 == 0x0A || $0 == 0x0D }) {
+            let lineData = lineBuffer.subdata(in: lineBuffer.startIndex..<newline)
+            lineBuffer.removeSubrange(lineBuffer.startIndex...newline)
+            if let line = String(data: lineData, encoding: .utf8), !line.isEmpty {
+                handle(line: line)
+            }
+        }
+
+        if lineBuffer.count > 64_000 {
+            lineBuffer.removeAll(keepingCapacity: true)
+        }
+    }
+
+    private func handle(line: String) {
+        appendLog(line)
+
+        if !slowFragmentedSite, line.lowercased().hasPrefix("[vimeo") {
+            slowFragmentedSite = true
+        }
+
+        if currentJob.isTooling {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if !trimmed.isEmpty { statusLine = String(trimmed.prefix(120)) }
+            return
+        }
+
+        if case .transcode = currentJob {
+            if let t = Self.parseFFmpegTime(line), let total = transcodeDuration, total > 0 {
+                progress = min(t / total, 1)
+            }
+            statusLine = "Перекодирование в H.264… \(Int(progress * 100))%"
+            return
+        }
+
+        if let percent = Self.parsePercent(line) {
+            progress = min(percent / 100, 1)
+            if line.contains("(frag ") { fragmentedDownload = true }
+            var s = (pendingAudioOnly ? "Скачивание аудио… " : "Скачивание… ") + "\(Int(percent))%"
+            if let eta = Self.parseETA(line) { s += " · осталось \(eta)" }
+            if let speed = Self.parseSpeed(line) { s += " · \(speed)" }
+            statusLine = s
+        } else if line.contains("[ExtractAudio]") {
+            statusLine = "Конвертация в MP3 320 kbps…"
+        } else if line.contains("[Merger]") {
+            statusLine = "Объединение видео и звука…"
+        } else if line.contains("[VideoRemuxer]") || line.contains("[VideoConvertor]") || line.contains("[Recode]") {
+            statusLine = "Упаковка в MP4…"
+        } else if line.contains("Destination:") {
+            statusLine = pendingAudioOnly ? "Скачивание аудио…" : "Скачивание…"
+        } else if line.lowercased().contains("error") {
+            statusLine = line.trimmingCharacters(in: .whitespaces)
+        }
+    }
+
+    private func appendLog(_ line: String) {
+        log += line + "\n"
+        if log.count > 120_000 {
+            log = "… (начало журнала обрезано) …\n" + log.suffix(90_000)
+        }
+    }
+
+    private static let percentRegex = try! NSRegularExpression(
+        pattern: #"\[download\]\s+([0-9]+(?:\.[0-9]+)?)%"#
+    )
+    private static let etaRegex = try! NSRegularExpression(
+        pattern: #"ETA\s+(\d+:\d{2}(?::\d{2})?)"#
+    )
+    private static let speedRegex = try! NSRegularExpression(
+        pattern: #"at\s+([0-9.]+\s?[KMGT]?i?B/s)"#
+    )
+
+    private static func firstGroup(_ line: String, _ regex: NSRegularExpression) -> String? {
+        let range = NSRange(line.startIndex..., in: line)
+        guard let m = regex.firstMatch(in: line, range: range),
+              let r = Range(m.range(at: 1), in: line) else { return nil }
+        return String(line[r])
+    }
+
+    static func parseETA(_ line: String) -> String? { firstGroup(line, etaRegex) }
+    static func parseSpeed(_ line: String) -> String? { firstGroup(line, speedRegex) }
+
+    static func parsePercent(_ line: String) -> Double? {
+        let range = NSRange(line.startIndex..., in: line)
+        guard let match = percentRegex.firstMatch(in: line, range: range),
+              let captured = Range(match.range(at: 1), in: line) else { return nil }
+        return Double(line[captured])
+    }
+
+    private func finish(status: Int32, reason: Process.TerminationReason) {
+        if !lineBuffer.isEmpty, let tail = String(data: lineBuffer, encoding: .utf8) {
+            handle(line: tail)
+            lineBuffer.removeAll(keepingCapacity: true)
+        }
+        process = nil
+        indeterminate = false
+
+        let job = currentJob
+
+        if reason == .uncaughtSignal {
+            phase = .cancelled
+            statusLine = "Отменено"
+            cookieQueue.removeAll()
+            if case .transcode = job, let tmp = transcodeOutput {
+                try? FileManager.default.removeItem(at: tmp)
+            }
+            return
+        }
+
+        if status == 0 {
+            switch job {
+            case .download:
+                UserDefaults.standard.set(currentCookieSource.storageKey, forKey: lastCookieKey)
+                cookieQueue.removeAll()
+                if pendingAudioOnly {
+                    markVideoFinished("Готово ✅ (MP3 320 kbps)",
+                                      file: newestDownloadedFile(extensions: ["mp3"]))
+                } else {
+                    checkCodecThenFinish()
+                }
+            case .transcode:
+                finalizeTranscode(ok: true)
+            case .tooling(_, let successStatus):
+                progress = 1
+                phase = .finished
+                statusLine = successStatus
+                refreshTools()
+            }
+            return
+        }
+
+        // Non-zero exit.
+        if job.isTooling { refreshTools() }
+
+        if case .transcode = job {
+            finalizeTranscode(ok: false)
+            return
+        }
+
+        if case .download = job {
+            let l = log.lowercased()
+            let permissionBlocked = l.contains("operation not permitted") && l.contains("cookie")
+            if permissionBlocked, case .browser("safari") = currentCookieSource {
+                sawSafariPermissionBlock = true
+                // Safari needs Full Disk Access — ask for that right away instead
+                // of silently burning through the other browsers first.
+                cookieQueue.removeAll()
+                needsFullDiskAccess = true
+                phase = .failed(Self.authWallMessage(fdaBlocked: true))
+                statusLine = "Нужен доступ к диску"
+                return
+            }
+
+            let authWall = Self.isAuthWall(l) || permissionBlocked
+
+            if authWall, !cookieQueue.isEmpty {
+                appendLog("note: \(currentCookieSource.describe) не подошло — пробую следующий способ")
+                runNextDownloadAttempt()
+                return
+            }
+
+            if authWall {
+                needsFullDiskAccess = sawSafariPermissionBlock
+                phase = .failed(Self.authWallMessage(fdaBlocked: sawSafariPermissionBlock))
+                statusLine = "Нужен вход в аккаунт"
+                return
+            }
+
+            if let hint = Self.friendlyDownloadError(in: log) {
+                phase = .failed(hint)
+                statusLine = "Ошибка"
+                return
+            }
+        }
+
+        let tail = log
+            .split(separator: "\n")
+            .suffix(6)
+            .joined(separator: "\n")
+        phase = .failed("\(job.label) завершился с ошибкой (код \(status)).\n\(tail)")
+        statusLine = "Ошибка"
+    }
+
+    private static func isAuthWall(_ l: String) -> Bool {
+        // YouTube
+        (l.contains("confirm you") && l.contains("bot"))
+        || l.contains("login_required")
+        || l.contains("sign in to confirm your age")
+        || l.contains("this video may be inappropriate")
+        || l.contains("members-only") || l.contains("join this channel")
+        || l.contains("account cookies are no longer valid")
+        // VK and generic
+        || l.contains("access denied")
+        || l.contains("only available for authorized")
+        || l.contains("available only for") || l.contains("only for friends")
+        || l.contains("please log in") || l.contains("log in to")
+        || l.contains("removed from public access")
+        // Vimeo
+        || l.contains("only works when logged")
+        || l.contains("provide account credentials")
+        || l.contains("unable to fetch new oauth tokens")
+    }
+
+    private static func authWallMessage(fdaBlocked: Bool) -> String {
+        if fdaBlocked {
+            return """
+            Это видео требует входа в аккаунт. Чтобы взять cookies из браузера, приложению нужен \
+            доступ к диску. Нажмите «Открыть настройки» — в списке приложений найдите \
+            VideoDownloader и включите «Полный доступ к диску» (если его там нет — нажмите \
+            «Показать приложение», это откроет его в Finder, перетащите оттуда). Перезапустите \
+            приложение и повторите.
+            """
+        }
+        return """
+        Сайт отдаёт это видео только при входе в аккаунт. Приложение проверило \
+        Safari\(Self.installedCookieBrowsers().contains("chrome") ? " и Chrome" : ""), \
+        но залогиненного аккаунта не нашло. Войдите на сайт (YouTube, VK, Vimeo…) в браузере \
+        и повторите. Vimeo сейчас требует вход почти для всех роликов, даже открытых.
+        """
+    }
+
+    // MARK: Auto-transcode to H.264
+
+    /// Sets the finished state for a completed video and plays the chime.
+    private func markVideoFinished(_ status: String, file: URL? = nil) {
+        progress = 1
+        phase = .finished
+        statusLine = status
+        lastDownloadedFile = file
+        playChime()
+    }
+
+    private func playChime() {
+        guard !UserDefaults.standard.bool(forKey: "muteChime") else { return }
+        let url = Bundle.main.url(forResource: "DownloadComplete", withExtension: "mp3")
+            ?? {
+                let home = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+                let candidate = home?.appendingPathComponent("download complete.mp3")
+                return (candidate.map { FileManager.default.isReadableFile(atPath: $0.path) } == true) ? candidate : nil
+            }()
+        guard let url else { return }
+        guard let player = try? AVAudioPlayer(contentsOf: url) else { return }
+        player.prepareToPlay()
+        player.play()
+        chimePlayer = player               // keep a strong ref while it plays
+    }
+
+    /// After a successful download, probe the file. If the video isn't H.264
+    /// (yt-dlp fell back to VP9/AV1), transcode it — otherwise we're done.
+    private func checkCodecThenFinish() {
+        progress = 1
+        statusLine = "Проверка кодека…"
+
+        let file = newestDownloadedFile(extensions: ["mp4", "mkv", "webm", "mov", "m4v"])
+        guard let ffmpeg = ffmpegPath, let file else {
+            markVideoFinished("Готово ✅", file: file)
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let info = Self.probeVideo(at: file, ffmpeg: ffmpeg)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let codec = (info.codec ?? "").lowercased()
+                if codec.isEmpty || codec == "h264" || codec == "avc1" {
+                    self.markVideoFinished("Готово ✅", file: file)
+                } else {
+                    self.log += "note: видео в \(codec.uppercased()), перекодирую в H.264\n"
+                    self.startTranscode(input: file, duration: info.duration)
+                }
+            }
+        }
+    }
+
+    private func startTranscode(input: URL, duration: Double?) {
+        guard let ffmpeg = ffmpegPath else {
+            markVideoFinished("Готово ✅ (кодек не H.264 — ffmpeg недоступен)", file: input)
+            return
+        }
+
+        let output = input.deletingPathExtension()
+            .appendingPathExtension("h264.mp4")
+        try? FileManager.default.removeItem(at: output)
+
+        transcodeInput = input
+        transcodeOutput = output
+        transcodeDuration = duration
+
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = "\((ffmpeg as NSString).deletingLastPathComponent):/usr/bin:/bin"
+
+        run(executableURL: URL(fileURLWithPath: ffmpeg),
+            arguments: [
+                "-y", "-hide_banner", "-loglevel", "info",
+                "-i", input.path,
+                "-map", "0:v:0", "-map", "0:a:0?",
+                "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "192k",
+                "-movflags", "+faststart",
+                output.path,
+            ],
+            environment: env,
+            job: .transcode,
+            startStatus: "Перекодирование в H.264…",
+            resetLog: false)
+    }
+
+    private func finalizeTranscode(ok: Bool) {
+        guard let input = transcodeInput, let output = transcodeOutput else {
+            phase = ok ? .finished : .failed("Не удалось перекодировать.")
+            return
+        }
+        let fm = FileManager.default
+
+        if ok, fm.fileExists(atPath: output.path) {
+            do {
+                try fm.removeItem(at: input)
+                try fm.moveItem(at: output, to: input)
+                markVideoFinished("Готово ✅ (перекодировано в H.264)", file: input)
+            } catch {
+                try? fm.removeItem(at: output)
+                markVideoFinished("Готово ✅ (H.264-копию сохранить не удалось, файл в исходном кодеке)", file: input)
+            }
+        } else {
+            try? fm.removeItem(at: output)
+            let tail = log.split(separator: "\n").suffix(5).joined(separator: "\n")
+            phase = .failed("""
+            Видео скачано (\(input.lastPathComponent)), но перекодировать в H.264 не удалось. \
+            Файл остался в исходном кодеке.
+            \(tail)
+            """)
+            statusLine = "Скачано, но не в H.264"
+        }
+
+        transcodeInput = nil
+        transcodeOutput = nil
+        transcodeDuration = nil
+    }
+
+    /// Newest matching file in the download folder (yt-dlp just wrote it).
+    private func newestDownloadedFile(extensions: Set<String>) -> URL? {
+        guard let dir = lastDestination else { return nil }
+        let exts = Set(extensions.map { $0.lowercased() })
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(
+            at: dir,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return nil }
+
+        return items
+            .filter { exts.contains($0.pathExtension.lowercased()) }
+            .filter {
+                let date = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+                return (date ?? .distantPast) > Date().addingTimeInterval(-600)
+            }
+            .max { a, b in
+                let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+                let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+                return da < db
+            }
+    }
+
+    private static let ffmpegTimeRegex = try! NSRegularExpression(
+        pattern: #"time=(\d+):(\d\d):(\d\d(?:\.\d+)?)"#
+    )
+    private static let ffmpegDurationRegex = try! NSRegularExpression(
+        pattern: #"Duration:\s*(\d+):(\d\d):(\d\d(?:\.\d+)?)"#
+    )
+    private static let ffmpegVideoRegex = try! NSRegularExpression(
+        pattern: #"Stream #\d+:\d+.*: Video: (\w+)"#
+    )
+
+    private static func parseFFmpegTime(_ line: String) -> Double? {
+        parseHMS(line, regex: ffmpegTimeRegex)
+    }
+
+    private static func parseHMS(_ line: String, regex: NSRegularExpression) -> Double? {
+        let range = NSRange(line.startIndex..., in: line)
+        guard let m = regex.firstMatch(in: line, range: range),
+              let hR = Range(m.range(at: 1), in: line),
+              let mR = Range(m.range(at: 2), in: line),
+              let sR = Range(m.range(at: 3), in: line),
+              let h = Double(line[hR]), let mm = Double(line[mR]), let s = Double(line[sR])
+        else { return nil }
+        return h * 3600 + mm * 60 + s
+    }
+
+    /// Runs `ffmpeg -i FILE` (which exits non-zero but prints stream info) and
+    /// pulls out the video codec and duration.
+    private static func probeVideo(at url: URL, ffmpeg: String) -> (codec: String?, duration: Double?) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: ffmpeg)
+        p.arguments = ["-hide_banner", "-i", url.path]
+        let errPipe = Pipe()
+        p.standardError = errPipe
+        p.standardOutput = Pipe()
+
+        do { try p.run() } catch { return (nil, nil) }
+        let data = errPipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+
+        guard let text = String(data: data, encoding: .utf8) else { return (nil, nil) }
+
+        var codec: String?
+        var duration: Double?
+        for line in text.split(separator: "\n").map(String.init) {
+            if codec == nil {
+                let r = NSRange(line.startIndex..., in: line)
+                if let m = ffmpegVideoRegex.firstMatch(in: line, range: r),
+                   let cR = Range(m.range(at: 1), in: line) {
+                    codec = String(line[cR])
+                }
+            }
+            if duration == nil {
+                duration = parseHMS(line, regex: ffmpegDurationRegex)
+            }
+        }
+        return (codec, duration)
+    }
+
+    /// Turns yt-dlp's other common failures into a one-line explanation.
+    /// (The "needs login" family is handled separately in `finish`.)
+    private static func friendlyDownloadError(in log: String) -> String? {
+        let l = log.lowercased()
+
+        if l.contains("video unavailable") || l.contains("this video is not available") {
+            return "Видео недоступно (удалено, приватное или заблокировано в вашем регионе)."
+        }
+        if l.contains("is not a valid url") || l.contains("unsupported url") {
+            return "Ссылка не распознана или сайт не поддерживается. Нужен прямой адрес страницы видео (YouTube, VK и т.д.)."
+        }
+        if l.contains("requested format is not available") {
+            return "Не нашёлся формат под выбранное качество — попробуйте «Максимальное»."
+        }
+        if l.contains("unable to download") && (l.contains("http error 403") || l.contains("403 forbidden")) {
+            return "YouTube отклонил загрузку (403). Откройте «Дополнительно» → «Обновить», затем повторите."
+        }
+        if l.contains("unable to resolve host") || l.contains("network is unreachable") || l.contains("connection refused") {
+            return "Нет соединения с интернетом."
+        }
+        return nil
+    }
+}
