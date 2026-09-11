@@ -70,8 +70,13 @@ if [ -f "$BG" ]; then
     cp "$BG" "$STAGE/.background/bg.png"
 fi
 README_RTF="$HERE/readme-unlock.rtf"
+BANG_ICON="$HERE/bang-icon.png"
 if [ -f "$README_RTF" ]; then
     cp "$README_RTF" "$STAGE/Если не открывается.rtf"
+    if [ -f "$BANG_ICON" ]; then
+        swift "$HERE/set-file-icon.swift" "$BANG_ICON" "$STAGE/Если не открывается.rtf" \
+            || echo "note: could not set custom icon on readme.rtf"
+    fi
 fi
 # volume icon = app icon
 if [ -f "$APP/Contents/Resources/AppIcon.icns" ]; then
@@ -112,7 +117,7 @@ tell application "Finder"
         set position of item "$NAME.app" of container window to {150, 185}
         set position of item "Applications" of container window to {490, 185}
         try
-            set position of item "Если не открывается.rtf" of container window to {580, 75}
+            set position of item "Если не открывается.rtf" of container window to {545, 330}
         end try
         update without registering applications
         delay 1

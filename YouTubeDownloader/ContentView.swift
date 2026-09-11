@@ -60,7 +60,7 @@ struct ContentView: View {
             footer
         }
         .padding(20)
-        .frame(minWidth: 560)
+        .frame(minWidth: 560, maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .onAppear {
             manager.refreshTools()
             if appearance == "auto" {
