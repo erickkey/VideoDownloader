@@ -19,7 +19,7 @@ FFMPEG_TAG="b6.0"
 
 # Bump this for every release that should trigger the in-app "update available"
 # notice (must match the "version" in version.json on GitHub).
-APP_VERSION="1.04"
+APP_VERSION="1.05"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/bin"
@@ -78,6 +78,7 @@ fi
 
 echo "==> resources"
 cp "$SRC/DownloadComplete.mp3" "$APP/Contents/Resources/"
+cp "$SRC/AppLaunch.mp3" "$APP/Contents/Resources/"
 
 echo "==> bundling yt-dlp + universal ffmpeg (~90 MB download)"
 BIN="$APP/Contents/Resources/bin"

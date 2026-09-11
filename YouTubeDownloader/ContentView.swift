@@ -1,11 +1,13 @@
 import SwiftUI
 import AppKit
+import AVFoundation
 
 struct ContentView: View {
 
     @StateObject private var manager = DownloadManager()
     @StateObject private var updateChecker = UpdateChecker()
     @State private var updateGlow = false
+    @State private var launchSoundPlayer: AVAudioPlayer?
 
     @AppStorage("destinationFolder") private var destinationPath: String =
         (FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first?.path)
@@ -94,6 +96,7 @@ struct ContentView: View {
             }
             applyAppearance()
             updateChecker.check()
+            playLaunchSound()
             fillURLFromClipboardIfEmpty()
         }
         .onChange(of: appearance) { _ in applyAppearance() }
@@ -113,6 +116,16 @@ struct ContentView: View {
             NSApp.dockTile.contentView = nil
         }
         NSApp.dockTile.display()
+    }
+
+    /// Plays a short sound once, when the app first launches.
+    private func playLaunchSound() {
+        guard let url = Bundle.main.url(forResource: "AppLaunch", withExtension: "mp3"),
+              let player = try? AVAudioPlayer(contentsOf: url)
+        else { return }
+        player.prepareToPlay()
+        player.play()
+        launchSoundPlayer = player   // keep a strong ref while it plays
     }
 
     /// If the field is empty and the clipboard holds something that looks
