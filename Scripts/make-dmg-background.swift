@@ -50,10 +50,11 @@ func text(_ s: String, size: CGFloat, weight: NSFont.Weight, alpha: CGFloat, y: 
 text("Добро пожаловать!", size: 17, weight: .semibold, alpha: 0.97, y: CGFloat(H) - 52)
 text("Рад облегчить твою жизнь", size: 12, weight: .regular, alpha: 0.55, y: CGFloat(H) - 74)
 
-// install hint + credit (bottom)
-text("Перетащите VideoDownloader в «Программы»", size: 13, weight: .medium, alpha: 0.95, y: 60)
-text("Drag VideoDownloader to the Applications folder", size: 11, weight: .regular, alpha: 0.38, y: 40)
-text("by Yaroslav Lukyanov", size: 10, weight: .regular, alpha: 0.30, y: 16)
+// install hint + first-launch tip + credit (bottom)
+text("Перетащите VideoDownloader в «Программы»", size: 13, weight: .medium, alpha: 0.95, y: 68)
+text("Первый запуск: правый клик по значку → «Открыть»", size: 11, weight: .medium, alpha: 0.65, y: 48)
+text("Drag VideoDownloader to the Applications folder", size: 11, weight: .regular, alpha: 0.38, y: 28)
+text("by Yaroslav Lukyanov", size: 10, weight: .regular, alpha: 0.30, y: 8)
 
 NSGraphicsContext.restoreGraphicsState()
 

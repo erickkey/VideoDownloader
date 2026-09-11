@@ -69,6 +69,10 @@ if [ -f "$BG" ]; then
     mkdir "$STAGE/.background"
     cp "$BG" "$STAGE/.background/bg.png"
 fi
+README_RTF="$HERE/readme-unlock.rtf"
+if [ -f "$README_RTF" ]; then
+    cp "$README_RTF" "$STAGE/Если не открывается.rtf"
+fi
 # volume icon = app icon
 if [ -f "$APP/Contents/Resources/AppIcon.icns" ]; then
     cp "$APP/Contents/Resources/AppIcon.icns" "$STAGE/.VolumeIcon.icns"
@@ -107,6 +111,9 @@ tell application "Finder"
         end try
         set position of item "$NAME.app" of container window to {150, 185}
         set position of item "Applications" of container window to {490, 185}
+        try
+            set position of item "Если не открывается.rtf" of container window to {580, 75}
+        end try
         update without registering applications
         delay 1
         close
