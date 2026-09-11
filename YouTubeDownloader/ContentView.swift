@@ -15,7 +15,7 @@ struct ContentView: View {
     @AppStorage("audioOnly") private var audioOnly = false
     @AppStorage("appearance") private var appearance = "auto"   // auto | light | dark
 
-    @AppStorage("lastURL") private var urlString = ""
+    @State private var urlString = ""
     @State private var showAdvanced = false
 
     // 0 = «Максимальное»; otherwise a height in px.
