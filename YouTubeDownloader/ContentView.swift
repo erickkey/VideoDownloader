@@ -44,6 +44,18 @@ struct ContentView: View {
         return "≈ " + Self.formatBytes(bytes)
     }
 
+    /// Label shown inside the quality dropdown itself — quality + size, so
+    /// every option shows its weight, not just the currently picked one.
+    private func qualityMenuLabel(_ h: Int) -> String {
+        if let text = approxSizeText(for: h) { return "\(qualityLabel(h)) — \(text)" }
+        return qualityLabel(h)
+    }
+
+    private var maxOptionMenuLabel: String {
+        if let text = approxSizeText(for: 0) { return "Максимальное — \(text)" }
+        return "Максимальное"
+    }
+
     private static func formatBytes(_ bytes: Int64) -> String {
         let mb = Double(bytes) / 1_000_000
         if mb >= 1000 { return String(format: "%.2f ГБ", mb / 1000) }
@@ -228,23 +240,18 @@ struct ContentView: View {
                     .font(.caption)
                     .foregroundStyle(audioOnly ? .tertiary : .secondary)
                 Picker("Качество", selection: $qualityHeight) {
-                    Text("Максимальное").tag(0)
+                    Text(maxOptionMenuLabel).tag(0)
                     ForEach(qualityOptions, id: \.self) { h in
-                        Text(qualityLabel(h)).tag(h)
+                        Text(qualityMenuLabel(h)).tag(h)
                     }
                 }
                 .labelsHidden()
-                .frame(width: 210)
+                .frame(width: 260)
                 .disabled(audioOnly)
                 .onChange(of: manager.availableHeights) { heights in
                     if qualityHeight != 0, !heights.isEmpty, !heights.contains(qualityHeight) {
                         qualityHeight = 0
                     }
-                }
-                if !audioOnly, let sizeText = approxSizeText(for: qualityHeight) {
-                    Text(sizeText)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
                 }
             }
 
@@ -608,7 +615,7 @@ struct AboutView: View {
                     .foregroundStyle(.secondary)
 
                 infoSection("Что умеет", [
-                    "Скачивать по ссылке в один клик — вставил, нажал «Скачать».",
+                    "Скачивать по ссылке в один клик.",
                     "Сама подставляет ссылку из буфера обмена, если она там есть — скопировал и сразу открыл программу.",
                     "Выбор качества: от 480p до 4K (или «максимальное»).",
                     "Показывает примерный размер файла для каждого качества (после «Проверить качество»).",
@@ -700,7 +707,13 @@ final class UpdateChecker: ObservableObject {
     func check() {
         let currentVersion = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0"
         Task {
-            var request = URLRequest(url: versionURL)
+            // raw.githubusercontent.com caches responses on its own CDN for a
+            // few minutes regardless of client cache headers, so a plain
+            // reloadIgnoringLocalCacheData isn't enough right after a
+            // release — bust it with a per-request query param instead.
+            var comps = URLComponents(url: versionURL, resolvingAgainstBaseURL: false)!
+            comps.queryItems = [URLQueryItem(name: "t", value: String(Int(Date().timeIntervalSince1970)))]
+            var request = URLRequest(url: comps.url!)
             request.cachePolicy = .reloadIgnoringLocalCacheData
             guard let (data, _) = try? await URLSession.shared.data(for: request),
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],

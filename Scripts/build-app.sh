@@ -19,7 +19,7 @@ FFMPEG_TAG="b6.0"
 
 # Bump this for every release that should trigger the in-app "update available"
 # notice (must match the "version" in version.json on GitHub).
-APP_VERSION="1.02"
+APP_VERSION="1.03"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/bin"
