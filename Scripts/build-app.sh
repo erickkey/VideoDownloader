@@ -17,6 +17,10 @@ DT="13.0"
 BUNDLE_ID="com.yaroslavlukyanov.VideoDownloader"
 FFMPEG_TAG="b6.0"
 
+# Bump this for every release that should trigger the in-app "update available"
+# notice (must match the "version" in version.json on GitHub).
+APP_VERSION="1.0"
+
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/bin"
 
@@ -42,8 +46,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 	<key>CFBundleIdentifier</key><string>${BUNDLE_ID}</string>
 	<key>CFBundleExecutable</key><string>VideoDownloader</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
-	<key>CFBundleShortVersionString</key><string>1.0</string>
-	<key>CFBundleVersion</key><string>1</string>
+	<key>CFBundleShortVersionString</key><string>${APP_VERSION}</string>
+	<key>CFBundleVersion</key><string>${APP_VERSION}</string>
 	<key>CFBundleIconFile</key><string>AppIcon</string>
 	<key>CFBundleIconName</key><string>AppIcon</string>
 	<key>LSMinimumSystemVersion</key><string>${DT}</string>

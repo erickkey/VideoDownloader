@@ -4,6 +4,8 @@ import AppKit
 struct ContentView: View {
 
     @StateObject private var manager = DownloadManager()
+    @StateObject private var updateChecker = UpdateChecker()
+    @State private var updateGlow = false
 
     @AppStorage("destinationFolder") private var destinationPath: String =
         (FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first?.path)
@@ -65,6 +67,7 @@ struct ContentView: View {
                 appearance = Self.systemIsDark() ? "dark" : "light"
             }
             applyAppearance()
+            updateChecker.check()
         }
         .onChange(of: appearance) { _ in applyAppearance() }
     }
@@ -107,15 +110,35 @@ struct ContentView: View {
     }
 
     private var footer: some View {
-        HStack(spacing: 14) {
+        HStack(alignment: .bottom, spacing: 14) {
             Button("О программе") { InfoPanel.about.show() }
                 .buttonStyle(.link)
             Button("Правовая информация") { InfoPanel.legal.show() }
                 .buttonStyle(.link)
             Spacer()
-            Text("by Yaroslav Lukyanov")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
+            VStack(alignment: .trailing, spacing: 3) {
+                if updateChecker.updateAvailable {
+                    Button {
+                        updateChecker.openDownload()
+                    } label: {
+                        Text("Доступно обновление"
+                             + (updateChecker.latestVersion.map { " (\($0))" } ?? ""))
+                            .font(.caption2.bold())
+                            .foregroundStyle(.red)
+                            .shadow(color: .red.opacity(updateGlow ? 0.85 : 0.25),
+                                    radius: updateGlow ? 6 : 2)
+                    }
+                    .buttonStyle(.plain)
+                    .onAppear {
+                        withAnimation(.easeInOut(duration: 1.1).repeatForever(autoreverses: true)) {
+                            updateGlow = true
+                        }
+                    }
+                }
+                Text("by Yaroslav Lukyanov")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
         }
         .font(.caption)
     }
@@ -570,5 +593,54 @@ struct LegalView: View {
     private func para(_ lead: String, _ rest: String) -> some View {
         (Text(lead).bold() + Text(" " + rest))
             .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+// MARK: - Update checker
+
+/// Fetches a tiny JSON file from GitHub on launch and compares its "version"
+/// to this build's own version. No auto-download — just points at the
+/// GitHub Release's stable "latest" URL for the user to grab themselves.
+@MainActor
+final class UpdateChecker: ObservableObject {
+    @Published private(set) var updateAvailable = false
+    @Published private(set) var latestVersion: String?
+
+    private let versionURL = URL(string:
+        "https://raw.githubusercontent.com/erickkey/VideoDownloader/main/version.json")!
+    private let downloadURL = URL(string:
+        "https://github.com/erickkey/VideoDownloader/releases/latest/download/VideoDownloader.dmg")!
+
+    func check() {
+        let currentVersion = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0"
+        Task {
+            var request = URLRequest(url: versionURL)
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+            guard let (data, _) = try? await URLSession.shared.data(for: request),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let remote = json["version"] as? String
+            else { return }
+
+            if Self.isNewer(remote, than: currentVersion) {
+                self.latestVersion = remote
+                self.updateAvailable = true
+            }
+        }
+    }
+
+    func openDownload() {
+        NSWorkspace.shared.open(downloadURL)
+    }
+
+    /// Simple dotted-version compare ("1.10" > "1.9").
+    private static func isNewer(_ a: String, than b: String) -> Bool {
+        let pa = a.split(separator: ".").compactMap { Int($0) }
+        let pb = b.split(separator: ".").compactMap { Int($0) }
+        for i in 0..<max(pa.count, pb.count) {
+            let x = i < pa.count ? pa[i] : 0
+            let y = i < pb.count ? pb[i] : 0
+            if x != y { return x > y }
+        }
+        return false
     }
 }
