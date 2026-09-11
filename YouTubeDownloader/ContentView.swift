@@ -36,6 +36,20 @@ struct ContentView: View {
         }
     }
 
+    /// "Максимальное" (0) shows the size of the best probed height; otherwise
+    /// the size for that exact height, if the probe found one.
+    private func approxSizeText(for height: Int) -> String? {
+        let h = height == 0 ? manager.availableHeights.first : height
+        guard let h, let bytes = manager.approxSizeByHeight[h] else { return nil }
+        return "≈ " + Self.formatBytes(bytes)
+    }
+
+    private static func formatBytes(_ bytes: Int64) -> String {
+        let mb = Double(bytes) / 1_000_000
+        if mb >= 1000 { return String(format: "%.2f ГБ", mb / 1000) }
+        return String(format: "%.0f МБ", mb)
+    }
+
     private var destinationURL: URL { URL(fileURLWithPath: destinationPath) }
 
     private var canDownload: Bool {
@@ -68,8 +82,37 @@ struct ContentView: View {
             }
             applyAppearance()
             updateChecker.check()
+            fillURLFromClipboardIfEmpty()
         }
         .onChange(of: appearance) { _ in applyAppearance() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            fillURLFromClipboardIfEmpty()
+        }
+        .onChange(of: manager.progress) { _ in updateDockProgress() }
+        .onChange(of: manager.isRunning) { _ in updateDockProgress() }
+    }
+
+    /// Draws a thin progress bar over the app's Dock icon while a download runs.
+    private func updateDockProgress() {
+        if manager.isRunning {
+            NSApp.dockTile.contentView = DockProgressView(progress: manager.progress)
+        } else {
+            NSApp.dockTile.contentView = nil
+        }
+        NSApp.dockTile.display()
+    }
+
+    /// If the field is empty and the clipboard holds something that looks
+    /// like a video URL, drop it in — saves friends a manual paste.
+    private func fillURLFromClipboardIfEmpty() {
+        guard urlString.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        guard let clip = NSPasteboard.general.string(forType: .string)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              let url = URL(string: clip),
+              let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https",
+              url.host != nil
+        else { return }
+        urlString = clip
     }
 
     // MARK: Appearance
@@ -197,11 +240,17 @@ struct ContentView: View {
                         qualityHeight = 0
                     }
                 }
+                if !audioOnly, let sizeText = approxSizeText(for: qualityHeight) {
+                    Text(sizeText)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             VStack(alignment: .leading, spacing: 6) {
                 Text(audioOnly
                      ? "Скачивается только звук в .mp3, 320 kbps."
+                       + (manager.approxAudioBytes.map { " ≈ " + Self.formatBytes($0) } ?? "")
                      : "Формат всегда .mp4 / H.264. Если сайт отдаёт VP9/AV1 — перекодируется сам.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
@@ -425,6 +474,39 @@ struct ContentView: View {
     }
 }
 
+// MARK: - Dock icon progress bar
+
+/// Redraws the app icon with a thin progress bar along the bottom, the way
+/// Finder/Safari show ongoing downloads in the Dock.
+private final class DockProgressView: NSView {
+    private let progress: Double
+
+    init(progress: Double) {
+        self.progress = progress
+        super.init(frame: NSRect(x: 0, y: 0, width: 128, height: 128))
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSApp.applicationIconImage?.draw(in: bounds)
+
+        let barHeight: CGFloat = 14
+        let inset: CGFloat = 10
+        let barRect = NSRect(x: inset, y: inset, width: bounds.width - inset * 2, height: barHeight)
+
+        NSColor.black.withAlphaComponent(0.35).setFill()
+        NSBezierPath(roundedRect: barRect, xRadius: barHeight / 2, yRadius: barHeight / 2).fill()
+
+        let fillWidth = max(0, min(1, progress)) * barRect.width
+        if fillWidth > 1 {
+            let fillRect = NSRect(x: barRect.minX, y: barRect.minY, width: fillWidth, height: barHeight)
+            NSColor.systemGreen.setFill()
+            NSBezierPath(roundedRect: fillRect, xRadius: barHeight / 2, yRadius: barHeight / 2).fill()
+        }
+    }
+}
+
 // MARK: - Info windows (О программе / Правовая информация)
 
 /// A reusable window shown centred on the screen.
@@ -526,9 +608,12 @@ struct AboutView: View {
 
                 infoSection("Что умеет", [
                     "Скачивать по ссылке в один клик — вставил, нажал «Скачать».",
+                    "Сама подставляет ссылку из буфера обмена, если она там есть — скопировал и сразу открыл программу.",
                     "Выбор качества: от 480p до 4K (или «максимальное»).",
+                    "Показывает примерный размер файла для каждого качества (после «Проверить качество»).",
                     "Всегда отдаёт .mp4 / H.264. Если сайт прислал видео в другом кодеке — программа сама перекодирует.",
                     "Только звук — скачать в .mp3 320 kbps (галочка).",
+                    "Прогресс скачивания виден прямо на иконке в Dock.",
                     "Звук-уведомление по завершении (можно отключить галочкой).",
                     "Кнопка «Показать файл» — открывает скачанное в Finder.",
                     "Работает на Intel и Apple Silicon, macOS 13 и новее.",

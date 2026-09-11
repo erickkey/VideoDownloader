@@ -55,6 +55,8 @@ final class DownloadManager: ObservableObject {
     @Published private(set) var isProbing = false
     @Published private(set) var probedTitle: String?
     @Published private(set) var availableHeights: [Int] = []      // sorted high → low
+    @Published private(set) var approxSizeByHeight: [Int: Int64] = [:]   // bytes, video+audio combined
+    @Published private(set) var approxAudioBytes: Int64?                 // bytes, mp3 320kbps estimate
 
     /// True while downloading a fragmented (DASH/HLS) stream.
     @Published private(set) var fragmentedDownload = false
@@ -161,6 +163,8 @@ final class DownloadManager: ObservableObject {
         if probedTitle != nil || !availableHeights.isEmpty {
             probedTitle = nil
             availableHeights = []
+            approxSizeByHeight = [:]
+            approxAudioBytes = nil
         }
     }
 
@@ -177,6 +181,8 @@ final class DownloadManager: ObservableObject {
         isProbing = true
         probedTitle = nil
         availableHeights = []
+        approxSizeByHeight = [:]
+        approxAudioBytes = nil
 
         let start = Date()
         statusLine = "Проверяю доступные качества… 0 с"
@@ -200,9 +206,11 @@ final class DownloadManager: ObservableObject {
                 self.probeTimer = nil
                 self.isProbing = false
                 let elapsed = String(format: "%.1f", Date().timeIntervalSince(start))
-                if let (title, heights) = result, !heights.isEmpty {
+                if let (title, heights, sizes, duration) = result, !heights.isEmpty {
                     self.probedTitle = title
                     self.availableHeights = heights
+                    self.approxSizeByHeight = sizes
+                    self.approxAudioBytes = duration.map { Int64($0 * 40_000) }   // 320 kbps ≈ 40 KB/s
                     self.statusLine = "Доступно (\(elapsed) с): " + heights.map { "\($0)p" }.joined(separator: ", ")
                 } else {
                     self.statusLine = "Не удалось определить качества за \(elapsed) с — при скачивании возьмётся максимум доступное."
@@ -211,7 +219,8 @@ final class DownloadManager: ObservableObject {
         }
     }
 
-    private static func runProbe(ytDlp: String, url: String, cookieArgs: [String]) -> (title: String, heights: [Int])? {
+    private static func runProbe(ytDlp: String, url: String, cookieArgs: [String])
+        -> (title: String, heights: [Int], sizeByHeight: [Int: Int64], duration: Double?)? {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: ytDlp)
         p.arguments = ["-J", "--no-warnings", "--no-playlist", "--no-progress"] + cookieArgs + [url]
@@ -232,12 +241,35 @@ final class DownloadManager: ObservableObject {
 
         let title = (json["title"] as? String) ?? "видео"
         var heights = Set<Int>()
+        var videoSizeByHeight: [Int: Int64] = [:]
+        var bestAudioSize: Int64 = 0
         for f in (json["formats"] as? [[String: Any]]) ?? [] {
-            guard (f["vcodec"] as? String).map({ $0 != "none" }) ?? false else { continue }
-            if let h = f["height"] as? Int, h > 0 { heights.insert(roundedHeight(h)) }
+            let vcodec = f["vcodec"] as? String
+            let acodec = f["acodec"] as? String
+            let size = int64(f["filesize"]) ?? int64(f["filesize_approx"])
+            if let v = vcodec, v != "none", let h = f["height"] as? Int, h > 0 {
+                let rh = roundedHeight(h)
+                heights.insert(rh)
+                if let size, size > (videoSizeByHeight[rh] ?? 0) {
+                    videoSizeByHeight[rh] = size
+                }
+            }
+            if let a = acodec, a != "none", vcodec == nil || vcodec == "none", let size, size > bestAudioSize {
+                bestAudioSize = size
+            }
         }
         if let h = json["height"] as? Int, h > 0 { heights.insert(roundedHeight(h)) }
-        return (title, heights.sorted(by: >))
+
+        var sizeByHeight: [Int: Int64] = [:]
+        for h in heights {
+            if let v = videoSizeByHeight[h] { sizeByHeight[h] = v + bestAudioSize }
+        }
+        let duration = (json["duration"] as? NSNumber)?.doubleValue
+        return (title, heights.sorted(by: >), sizeByHeight, duration)
+    }
+
+    private static func int64(_ any: Any?) -> Int64? {
+        (any as? NSNumber)?.int64Value
     }
 
     /// Snap odd heights (e.g. 1088, 362) to the familiar rung.
