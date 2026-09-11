@@ -106,6 +106,26 @@ struct ContentView: View {
         }
         .onChange(of: manager.progress) { _ in updateDockProgress() }
         .onChange(of: manager.isRunning) { _ in updateDockProgress() }
+        .onChange(of: showAdvanced) { expanded in resizeWindowForAdvanced(expanded) }
+    }
+
+    /// Roughly the height "Дополнительно" adds once expanded (tools block +
+    /// divider + log view + spacing) — grows/shrinks the window to match
+    /// instead of just leaving blank space or clipping content.
+    private static let advancedSectionHeight: CGFloat = 250
+
+    private func resizeWindowForAdvanced(_ expanded: Bool) {
+        guard let window = NSApp.keyWindow ?? NSApp.mainWindow else { return }
+        var frame = window.frame
+        let delta = Self.advancedSectionHeight
+        if expanded {
+            frame.origin.y -= delta
+            frame.size.height += delta
+        } else {
+            frame.origin.y += delta
+            frame.size.height -= delta
+        }
+        window.setFrame(frame, display: true, animate: true)
     }
 
     /// Draws a thin progress bar over the app's Dock icon while a download runs.

@@ -1,5 +1,13 @@
-// Generates a white "!" on a transparent 1024×1024 canvas, heavily padded
-// so it reads as roughly half-size once Finder renders it in an icon slot.
+// Generates a "!" icon for the unlock-instructions file: white glyph on a
+// solid red circle, centered on a transparent 1024×1024 canvas.
+//
+// A bare glyph (no fill behind it) doesn't work here: Finder hit-tests
+// custom file icons by alpha, and a thin shape like "!" leaves most of the
+// icon's square transparent, so clicks next to the stroke miss the item
+// entirely and only the text label below responds. A filled circle keeps
+// the icon clearly smaller than the app/Applications icons next to it
+// while staying fully clickable anywhere within it.
+//
 // Usage: swift Scripts/make-bang-icon.swift <out.png>
 
 import AppKit
@@ -15,8 +23,18 @@ guard let rep = NSBitmapImageRep(
 
 NSGraphicsContext.saveGraphicsState()
 NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+let ctx = NSGraphicsContext.current!.cgContext
 
-let config = NSImage.SymbolConfiguration(pointSize: 380, weight: .bold)
+// Solid circle — smaller than the full canvas (reads smaller than a
+// full-bleed app icon) and fully opaque (so the whole visible icon is
+// one clickable hit area, not just the thin glyph on top of it).
+let diameter: CGFloat = 700
+let circleRect = CGRect(x: (CGFloat(S) - diameter) / 2, y: (CGFloat(S) - diameter) / 2,
+                         width: diameter, height: diameter)
+ctx.setFillColor(NSColor.systemRed.cgColor)
+ctx.fillEllipse(in: circleRect)
+
+let config = NSImage.SymbolConfiguration(pointSize: 340, weight: .black)
 guard let symbol = NSImage(systemSymbolName: "exclamationmark", accessibilityDescription: nil)?
     .withSymbolConfiguration(config)
 else { fatalError("no symbol") }
