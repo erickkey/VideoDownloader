@@ -41,13 +41,9 @@ jobs:
           if [ "$DELTA" -lt 0 ]; then DELTA=0; fi
 
           if [ "$FIRST_RUN" = true ]; then
-            TEXT="📊 VideoDownloader — статистика скачиваний
-Настроено. Всего скачиваний на сейчас: ${TOTAL}.
-Со следующего дня здесь будет прирост за сутки."
+            TEXT=$(printf '📊 VideoDownloader — статистика скачиваний\nНастроено. Всего скачиваний на сейчас: %s.\nСо следующего дня здесь будет прирост за сутки.' "$TOTAL")
           else
-            TEXT="📊 VideoDownloader — статистика скачиваний
-За сутки: ${DELTA}
-Всего: ${TOTAL}"
+            TEXT=$(printf '📊 VideoDownloader — статистика скачиваний\nЗа сутки: %s\nВсего: %s' "$DELTA" "$TOTAL")
           fi
 
           curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
