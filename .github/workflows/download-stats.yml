@@ -2,8 +2,8 @@ name: Daily download stats to Telegram
 
 on:
   schedule:
-    # 06:00 UTC = 09:00 MSK
-    - cron: "0 6 * * *"
+    # 19:00 UTC = 22:00 MSK
+    - cron: "0 19 * * *"
   workflow_dispatch: {}
 
 permissions:
