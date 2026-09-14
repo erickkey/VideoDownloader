@@ -308,13 +308,6 @@ enum Translations {
             "YouTube rejected the download (403). Open “Advanced” → “Update”, then try again. Or try a different link.",
         "Нет соединения с интернетом.": "No internet connection.",
 
-        // MARK: Remember-window-size prompt (AppDelegate)
-        "Запомнить размер окна?": "Remember the window size?",
-        "Вы изменили размер окна — использовать этот размер (%d×%d) при следующем запуске?":
-            "You resized the window — use this size (%d×%d) next time it opens?",
-        "Запомнить": "Remember",
-        "Не запоминать": "Don't remember",
-
         // MARK: formatBytes
         "%.2f ГБ": "%.2f GB",
         "%.0f МБ": "%.0f MB",

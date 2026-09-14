@@ -190,23 +190,20 @@ struct ContentView: View {
     /// opens at.
     private static let preferredWindowSize = NSSize(width: 850, height: 590)
 
-    /// Sizes the window once at launch: the size remembered from a previous
-    /// quit (see the "Запомнить размер окна?" prompt in AppDelegate) if
-    /// there is one, otherwise `preferredWindowSize` — scaled down to fit a
-    /// smaller screen if needed. The aspect ratio always wins over the
-    /// literal pixel size, so it never overflows a small display.
+    /// Sizes the window once at launch to `preferredWindowSize`, scaled down
+    /// to fit a smaller screen if needed. The aspect ratio always wins over
+    /// the literal pixel size, so it never overflows a small display.
+    /// Resizing afterwards is completely free and is never remembered
+    /// across launches — every launch opens at the same size on purpose.
     private func applyInitialWindowSizeIfNeeded() {
         guard let window = NSApp.keyWindow ?? NSApp.mainWindow else { return }
-        MainWindowHolder.window = window
-        let defaults = UserDefaults.standard
+        // Matches the fix already applied to every other window in the app
+        // (InfoPanel, AdvancedSettingsPanel, etc.) — macOS silently persists
+        // and later restores this window's frame on its own otherwise,
+        // fighting whatever size we set here.
+        window.isRestorable = false
 
         var target = Self.preferredWindowSize
-        let rememberedWidth = defaults.double(forKey: "rememberedWindowWidth")
-        let rememberedHeight = defaults.double(forKey: "rememberedWindowHeight")
-        if rememberedWidth > 0, rememberedHeight > 0 {
-            target = NSSize(width: rememberedWidth, height: rememberedHeight)
-        }
-
         if let screen = window.screen ?? NSScreen.main {
             let visible = screen.visibleFrame
             let margin: CGFloat = 60
@@ -216,19 +213,15 @@ struct ContentView: View {
             }
         }
 
-        var frame = window.frame
-        frame.size = target
-        window.setFrame(frame, display: true, animate: false)
+        // `target` is a *content* size — it mirrors the `idealWidth`/
+        // `idealHeight` declared on ContentView's `.frame()` in
+        // YouTubeDownloaderApp.swift, which SwiftUI treats as content size,
+        // not the outer window frame. `setContentSize` maps that correctly;
+        // writing it straight into `window.frame.size` used to leave the
+        // content ~28pt (a title bar's height) short of its declared
+        // minHeight.
+        window.setContentSize(target)
         window.centerExactlyOnScreen()
-
-        // Save what the window's frame *actually* ended up at, not the
-        // `target` we merely asked for — AppKit can adjust the requested
-        // size (e.g. to respect minSize/idealSize constraints), and saving
-        // our intention instead of the real result made the "remember size?"
-        // prompt fire on quit even when the user never touched the window.
-        let appliedSize = window.frame.size
-        defaults.set(Double(appliedSize.width), forKey: "lastAppliedWindowWidth")
-        defaults.set(Double(appliedSize.height), forKey: "lastAppliedWindowHeight")
     }
 
     /// Draws a thin progress bar over the app's Dock icon while a download runs.
@@ -310,7 +303,6 @@ struct ContentView: View {
             "«Поделиться» — можно быстро отправить другу ссылку на программу.",
             "Обновление встроенных инструментов — понятный раздел: «Проверить обновление» показывает, есть ли новая версия, кнопка «Обновить» активна только когда реально есть что обновлять.",
             "«Обратная связь» — отдельный раздел: написать вопрос, пожелание или что угодно ещё, по желанию оставив имя и контакт.",
-            "Можно запомнить нужный размер окна — при выходе программа спросит, сохранить ли его.",
             "Версия программы видна в шапке окна.",
             "Технический журнал скрыт от пользователя.",
             "Мелкие внутренние улучшения и исправления.",
