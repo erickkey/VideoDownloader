@@ -84,12 +84,13 @@ struct ContentView: View {
         "zip", "rar", "7z", "tar", "gz",
     ]
 
-    /// True for anything that plausibly points at a video page — a full
-    /// http(s) link, or the shorthand people actually type/paste, like
-    /// "www.site.com/…" or a bare "site.com/…" with no scheme at all.
-    private static func isPlausibleURLString(_ raw: String) -> Bool {
+    /// Returns the parsed URL for anything that plausibly points at a video
+    /// page — a full http(s) link, or the shorthand people actually
+    /// type/paste, like "www.site.com/…" or a bare "site.com/…" with no
+    /// scheme at all — nil otherwise.
+    private static func urlIfPlausible(_ raw: String) -> URL? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !trimmed.contains(" ") else { return false }
+        guard !trimmed.isEmpty, !trimmed.contains(" ") else { return nil }
 
         let hasHTTPScheme = URL(string: trimmed)
             .flatMap(\.scheme)
@@ -101,11 +102,35 @@ struct ContentView: View {
               let tld = host.split(separator: ".").last.map(String.init),
               tld.count >= 2, tld.allSatisfy({ $0.isLetter }),
               !nonDomainExtensions.contains(url.pathExtension.lowercased())
-        else { return false }
-        return true
+        else { return nil }
+        return url
+    }
+
+    private static func isPlausibleURLString(_ raw: String) -> Bool {
+        urlIfPlausible(raw) != nil
     }
 
     private var isPlausibleURL: Bool { Self.isPlausibleURLString(urlString) }
+
+    /// Soft signal only — yt-dlp has no real "unsupported site" concept (an
+    /// unrecognized domain just falls through to its generic page-scraping
+    /// extractor), so this never blocks a download. It only flags that the
+    /// domain isn't one of the ~1150 sites with their own dedicated parser,
+    /// worth a gentle heads-up and nothing stronger.
+    private var isKnownSite: Bool {
+        guard let host = Self.urlIfPlausible(urlString)?.host else { return true }
+        return SupportedSites.isKnown(host: host)
+    }
+
+    /// True when the link has nothing after the domain — just
+    /// "twitch.tv" or "youtube.com/", not an actual video/channel/clip
+    /// page. Pasting a bare homepage is a common mistake and, unlike an
+    /// unrecognized site, this one *is* checkable offline with confidence.
+    private var isBareHomepage: Bool {
+        guard let url = Self.urlIfPlausible(urlString) else { return false }
+        let path = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        return path.isEmpty && (url.query?.isEmpty ?? true)
+    }
 
     private var canDownload: Bool {
         isPlausibleURL
@@ -446,11 +471,19 @@ struct ContentView: View {
             // Always renders (blank when not applicable) so this row's
             // height is reserved up front — showing/hiding it used to shove
             // everything below it up and down as you typed.
-            let showURLWarning = !urlString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isPlausibleURL
-            Text(showURLWarning ? tr("Кажется, это не ссылка — проверь, что скопировалось") : " ")
+            let hasText = !urlString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            let showURLWarning = hasText && !isPlausibleURL
+            let showHomepageHint = hasText && isPlausibleURL && isBareHomepage
+            let showKnownSiteHint = hasText && isPlausibleURL && !isBareHomepage && isKnownSite
+            let showUnknownSiteHint = hasText && isPlausibleURL && !isBareHomepage && !isKnownSite
+            Text(showURLWarning ? tr("Кажется, это не ссылка — проверь, что скопировалось")
+                 : showHomepageHint ? tr("Это главная страница сайта, а не ссылка на видео")
+                 : showKnownSiteHint ? tr("Сайт есть в списке поддерживаемых ✅")
+                 : showUnknownSiteHint ? tr("Необычный сайт — программа попробует, но результат не гарантирован")
+                 : " ")
                 .font(.caption)
-                .foregroundStyle(.red)
-                .opacity(showURLWarning ? 1 : 0)
+                .foregroundStyle(showURLWarning || showHomepageHint ? .red : showKnownSiteHint ? .green : .orange)
+                .opacity(showURLWarning || showHomepageHint || showKnownSiteHint || showUnknownSiteHint ? 1 : 0)
 
             Text(manager.probedTitle.map { "▸ \($0)" } ?? " ")
                 .font(.caption)

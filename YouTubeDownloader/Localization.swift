@@ -80,6 +80,9 @@ enum Translations {
         "https://vk.com/video…  или  https://www.youtube.com/watch?v=…":
             "https://vk.com/video…  or  https://www.youtube.com/watch?v=…",
         "Кажется, это не ссылка — проверь, что скопировалось": "Doesn't look like a link — check what you copied",
+        "Это главная страница сайта, а не ссылка на видео": "That's the site's homepage, not a link to a video",
+        "Необычный сайт — программа попробует, но результат не гарантирован": "Unusual site — the app will try, but success isn't guaranteed",
+        "Сайт есть в списке поддерживаемых ✅": "Site is in the supported list ✅",
         "видео": "video",
 
         // MARK: Quality section
