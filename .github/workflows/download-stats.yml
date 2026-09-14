@@ -1,0 +1,65 @@
+name: Daily download stats to Telegram
+
+on:
+  schedule:
+    # 06:00 UTC = 09:00 MSK
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute totals and send Telegram digest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -eu
+
+          STATE_FILE=".github/download-stats-state.json"
+          REPO="${{ github.repository }}"
+
+          TOTAL=$(gh api "repos/$REPO/releases" --paginate \
+            --jq '[.[].assets[].download_count] | add // 0')
+
+          if [ -f "$STATE_FILE" ]; then
+            PREV=$(jq -r '.total // 0' "$STATE_FILE")
+            FIRST_RUN=false
+          else
+            PREV=$TOTAL
+            FIRST_RUN=true
+          fi
+
+          DELTA=$((TOTAL - PREV))
+          if [ "$DELTA" -lt 0 ]; then DELTA=0; fi
+
+          if [ "$FIRST_RUN" = true ]; then
+            TEXT="📊 VideoDownloader — статистика скачиваний
+Настроено. Всего скачиваний на сейчас: ${TOTAL}.
+Со следующего дня здесь будет прирост за сутки."
+          else
+            TEXT="📊 VideoDownloader — статистика скачиваний
+За сутки: ${DELTA}
+Всего: ${TOTAL}"
+          fi
+
+          curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${TEXT}" > /dev/null
+
+          echo "{\"total\": $TOTAL}" > "$STATE_FILE"
+
+          if ! git diff --quiet -- "$STATE_FILE"; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add "$STATE_FILE"
+            git commit -m "Update download stats state [skip ci]"
+            git push
+          fi
