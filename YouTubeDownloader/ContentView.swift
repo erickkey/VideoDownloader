@@ -144,12 +144,7 @@ struct ContentView: View {
             playLaunchSound()
             fillURLFromClipboardIfEmpty()
             DispatchQueue.main.async {
-                applyInitialWindowSizeIfNeeded()
-                if LanguagePickerPanel.shouldShowOnLaunch {
-                    LanguagePickerPanel.shared.show(onDismiss: { showWhatsNewIfNeeded() })
-                } else {
-                    showWhatsNewIfNeeded()
-                }
+                runLaunchWindowSequenceWhenActive()
             }
         }
         .onChange(of: appearance) { _ in applyAppearance() }
@@ -183,6 +178,38 @@ struct ContentView: View {
         }
         .padding(20)
         .frame(maxWidth: .infinity, alignment: .top)
+    }
+
+    /// Creating and ordering-front a new `NSWindow` (the language picker,
+    /// "what's new") *before* the app has actually finished becoming the
+    /// active app can leave that window self-reporting as visible/key while
+    /// the WindowServer never actually composites it on screen — seen
+    /// directly while testing a cold, first-ever launch (Gatekeeper's
+    /// "downloaded from the internet" flow makes launch slower and less
+    /// predictable than a plain local relaunch). Waiting for
+    /// `didBecomeActiveNotification` when the app isn't active yet sidesteps
+    /// the race instead of assuming `onAppear` already means it's safe.
+    private func runLaunchWindowSequenceWhenActive() {
+        guard NSApp.isActive else {
+            var observer: NSObjectProtocol?
+            observer = NotificationCenter.default.addObserver(
+                forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+            ) { _ in
+                if let observer { NotificationCenter.default.removeObserver(observer) }
+                runLaunchWindowSequenceNow()
+            }
+            return
+        }
+        runLaunchWindowSequenceNow()
+    }
+
+    private func runLaunchWindowSequenceNow() {
+        applyInitialWindowSizeIfNeeded()
+        if LanguagePickerPanel.shouldShowOnLaunch {
+            LanguagePickerPanel.shared.show(onDismiss: { showWhatsNewIfNeeded() })
+        } else {
+            showWhatsNewIfNeeded()
+        }
     }
 
     /// The user's preferred window shape. Resizing afterwards is completely
