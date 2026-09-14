@@ -273,12 +273,19 @@ struct ContentView: View {
     }
 
     /// Shows the "what's new" panel once per version, right after an update.
+    /// `lastSeenChangelogVersion` is only written once the user actually
+    /// clicks the button under the list (`onAcknowledge`) — not the instant
+    /// `.show()` is called — so if the window is ever created but somehow
+    /// never reaches the user (any future rendering hiccup, a launch that
+    /// gets interrupted, …), it simply shows again next launch instead of
+    /// silently burning its one chance.
     private func showWhatsNewIfNeeded() {
         guard let version = Self.appVersionString, version != lastSeenChangelogVersion,
               let items = Self.changelog[version]
         else { return }
-        WhatsNewPanel.shared.show(version: version, items: items)
-        lastSeenChangelogVersion = version
+        WhatsNewPanel.shared.show(version: version, items: items, onAcknowledge: {
+            lastSeenChangelogVersion = version
+        })
     }
 
     /// If the field is empty and the clipboard holds something that looks
@@ -1144,10 +1151,13 @@ final class WhatsNewPanel {
     static let shared = WhatsNewPanel()
     private var window: NSWindow?
 
-    func show(version: String, items: [String]) {
+    func show(version: String, items: [String], onAcknowledge: @escaping () -> Void) {
         NSApp.activate(ignoringOtherApps: true)
         let hosting = NSHostingController(
-            rootView: WhatsNewView(items: items, onClose: { [weak self] in self?.window?.close() })
+            rootView: WhatsNewView(items: items, onClose: { [weak self] in
+                onAcknowledge()
+                self?.window?.close()
+            })
         )
         let win = NSWindow(contentViewController: hosting)
         win.styleMask = [.titled, .closable]
