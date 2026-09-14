@@ -31,31 +31,46 @@ jobs:
 
           if [ -f "$STATE_FILE" ]; then
             PREV=$(jq -r '.total // 0' "$STATE_FILE")
+            WEEK_START=$(jq -r '.week_start_total // .total // 0' "$STATE_FILE")
             FIRST_RUN=false
           else
             PREV=$TOTAL
+            WEEK_START=$TOTAL
             FIRST_RUN=true
           fi
 
-          DELTA=$((TOTAL - PREV))
-          if [ "$DELTA" -lt 0 ]; then DELTA=0; fi
+          DAILY=$((TOTAL - PREV))
+          if [ "$DAILY" -lt 0 ]; then DAILY=0; fi
+
+          WEEKLY=$((TOTAL - WEEK_START))
+          if [ "$WEEKLY" -lt 0 ]; then WEEKLY=0; fi
+
+          # ISO weekday: 1=Monday .. 7=Sunday — Sunday's run also gets a week summary.
+          WEEKDAY=$(date -u +%u)
 
           if [ "$FIRST_RUN" = true ]; then
-            TEXT=$(printf '📊 VideoDownloader — статистика скачиваний\nНастроено. Всего скачиваний на сейчас: %s.\nСо следующего дня здесь будет прирост за сутки.' "$TOTAL")
+            TEXT=$(printf '📊 VideoDownloader — статистика скачиваний\nНастроено. Всего скачиваний на сейчас: %s.\nСо следующего дня здесь будет прирост за сутки, а по воскресеньям — итог за неделю.' "$TOTAL")
+            NEW_WEEK_START=$TOTAL
           else
-            TEXT=$(printf '📊 VideoDownloader — статистика скачиваний\nЗа сутки: %s\nВсего: %s' "$DELTA" "$TOTAL")
+            TEXT=$(printf '📊 VideoDownloader — статистика скачиваний\nЗа день: %s\nВсего: %s' "$DAILY" "$TOTAL")
+            if [ "$WEEKDAY" = "7" ]; then
+              TEXT=$(printf '%s\n\n📅 Итог недели\nЗа неделю: %s\nВсего: %s' "$TEXT" "$WEEKLY" "$TOTAL")
+              NEW_WEEK_START=$TOTAL
+            else
+              NEW_WEEK_START=$WEEK_START
+            fi
           fi
 
           curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
             --data-urlencode "text=${TEXT}" > /dev/null
 
-          echo "{\"total\": $TOTAL}" > "$STATE_FILE"
+          echo "{\"total\": $TOTAL, \"week_start_total\": $NEW_WEEK_START}" > "$STATE_FILE"
 
-          if ! git diff --quiet -- "$STATE_FILE"; then
+          git add "$STATE_FILE"
+          if ! git diff --cached --quiet -- "$STATE_FILE"; then
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add "$STATE_FILE"
             git commit -m "Update download stats state [skip ci]"
             git push
           fi
